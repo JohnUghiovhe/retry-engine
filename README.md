@@ -17,6 +17,27 @@ To run the end-to-end demo against a mock flaky upstream:
 npm test
 ```
 
+## Project Structure
+
+```text
+src/
+  persistence/
+    retry-storage.ts
+  retry-engine.ts
+  server.ts
+  demo.ts
+  types.ts
+  utils/
+    http-utils.ts
+    json-utils.ts
+    worker-utils.ts
+  validation/
+    request-validation.ts
+    url-safety.ts
+```
+
+The main retry engine stays in `src/retry-engine.ts`; the shared helpers live under `src/utils` and `src/validation` so the entrypoints stay small.
+
 ## Endpoints
 
 Create a request:
@@ -108,7 +129,6 @@ I now think more carefully about failure classes. A 4xx is not the same as a 5xx
 
 ## Resources I Consulted
 
-- [SQLite wrapper docs](https://github.com/kriasoft/node-sqlite)
 - [SQLite documentation](https://www.sqlite.org/docs.html)
 - [MDN: Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API)
 - [MDN: AbortController](https://developer.mozilla.org/en-US/docs/Web/API/AbortController)

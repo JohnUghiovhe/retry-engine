@@ -1,6 +1,10 @@
 import 'dotenv/config';
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { RequestValidationError, RetryEngine, RetryStorage } from './retry-engine';
+import { RetryEngine } from './retry-engine';
+import { RetryStorage } from './persistence/retry-storage';
+import { RequestValidationError } from './validation/request-validation';
+import { PayloadTooLargeError, parseAllowedHosts, readJsonBody, sendJson } from './utils/http-utils';
+import { normalizePositiveInteger } from './utils/worker-utils';
 import { RequestStatus } from './types';
 
 const port = normalizePositiveInteger(process.env.PORT ? Number(process.env.PORT) : undefined, 3000);
@@ -101,65 +105,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   }
 }
 
-class PayloadTooLargeError extends Error {
-  constructor() {
-    super('request body too large');
-    this.name = 'PayloadTooLargeError';
-  }
-}
-
-async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  let totalBytes = 0;
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    totalBytes += buffer.length;
-    if (totalBytes > maxBytes) {
-      throw new PayloadTooLargeError();
-    }
-
-    chunks.push(buffer);
-  }
-
-  if (chunks.length === 0) {
-    return {};
-  }
-
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-}
-
 function isRequestStatus(value: string): value is RequestStatus {
   return value === 'pending' || value === 'retrying' || value === 'completed' || value === 'failed';
-}
-
-function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
-  const body = JSON.stringify(payload, null, 2);
-  res.writeHead(statusCode, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(body),
-  });
-  res.end(body);
-}
-
-function normalizePositiveInteger(value: number | undefined, fallback: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-    return fallback;
-  }
-
-  return Math.floor(value);
-}
-
-function parseAllowedHosts(value: string | undefined): string[] | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  const hosts = value
-    .split(',')
-    .map((host) => host.trim())
-    .filter((host) => host.length > 0);
-
-  return hosts.length > 0 ? hosts : undefined;
 }
 
 if (require.main === module) {
