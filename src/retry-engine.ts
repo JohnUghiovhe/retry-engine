@@ -1,6 +1,8 @@
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import sqlite3 = require('sqlite3');
 import { open, type Database } from 'sqlite';
 import {
@@ -29,7 +31,80 @@ export interface RetryEngineOptions {
   workerIntervalMs?: number;
   defaultBackoffMs?: number;
   defaultTimeoutMs?: number;
+  concurrencyLimit?: number;
+  lockTimeoutMs?: number;
+  allowPrivateTargets?: boolean;
+  allowedHosts?: string[];
   logger?: (message: string) => void;
+}
+
+const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
+
+export class RequestValidationError extends Error {
+  readonly statusCode = 400;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'RequestValidationError';
+  }
+}
+
+export interface RequestValidationOptions {
+  allowPrivateTargets?: boolean;
+  allowedHosts?: string[];
+}
+
+export function validateCreateRequestInput(input: unknown, options: RequestValidationOptions = {}): string | null {
+  if (!input || typeof input !== 'object') {
+    return 'body must be a JSON object';
+  }
+
+  const candidate = input as Partial<CreateRequestInput>;
+  if (typeof candidate.url !== 'string' || candidate.url.trim().length === 0) {
+    return 'url is required';
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(candidate.url);
+  } catch {
+    return 'url must be valid';
+  }
+
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    return 'url must use http or https';
+  }
+
+  if (typeof candidate.method !== 'string' || candidate.method.trim().length === 0) {
+    return 'method is required';
+  }
+
+  const normalizedMethod = candidate.method.toUpperCase();
+  if (!ALLOWED_METHODS.has(normalizedMethod)) {
+    return 'method must be one of GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS';
+  }
+
+  const maxRetriesError = validateOptionalInteger(candidate.maxRetries, 0, 100, 'maxRetries');
+  if (maxRetriesError) {
+    return maxRetriesError;
+  }
+
+  const backoffError = validateOptionalInteger(candidate.backoffMs, 1, 86_400_000, 'backoffMs');
+  if (backoffError) {
+    return backoffError;
+  }
+
+  const timeoutError = validateOptionalInteger(candidate.timeoutMs, 1, 300_000, 'timeoutMs');
+  if (timeoutError) {
+    return timeoutError;
+  }
+
+  const bodyError = validateSerializableBody(candidate.body);
+  if (bodyError) {
+    return bodyError;
+  }
+
+  return validateTargetUrlSync(parsedUrl, options);
 }
 
 export class RetryStorage {
@@ -66,6 +141,7 @@ export class RetryStorage {
         backoffMs INTEGER NOT NULL,
         timeoutMs INTEGER NOT NULL,
         nextRetryAt INTEGER,
+        lockedUntil INTEGER NOT NULL DEFAULT 0,
         lastError TEXT,
         result TEXT,
         createdAt INTEGER NOT NULL,
@@ -102,13 +178,14 @@ export class RetryStorage {
       id: randomUUID(),
       url: input.url,
       method: input.method.toUpperCase(),
-      body: input.body === undefined ? null : JSON.stringify(input.body),
+      body: serializeBody(input.body),
       status: 'pending',
       attemptCount: 0,
       maxRetries: normalizePositiveInteger(input.maxRetries, 5),
       backoffMs: normalizePositiveInteger(input.backoffMs, defaults.backoffMs),
       timeoutMs: normalizePositiveInteger(input.timeoutMs, defaults.timeoutMs),
       nextRetryAt: null,
+      lockedUntil: 0,
       lastError: null,
       result: null,
       createdAt: now,
@@ -118,8 +195,8 @@ export class RetryStorage {
     await db.run(
       `INSERT INTO requests (
         id, url, method, body, status, attemptCount, maxRetries, backoffMs, timeoutMs,
-        nextRetryAt, lastError, result, createdAt, updatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        nextRetryAt, lockedUntil, lastError, result, createdAt, updatedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       row.id,
       row.url,
       row.method,
@@ -130,6 +207,7 @@ export class RetryStorage {
       row.backoffMs,
       row.timeoutMs,
       row.nextRetryAt,
+      row.lockedUntil,
       row.lastError,
       row.result,
       row.createdAt,
@@ -159,11 +237,36 @@ export class RetryStorage {
       `SELECT * FROM requests
        WHERE status IN ('pending', 'retrying')
          AND (nextRetryAt IS NULL OR nextRetryAt <= ?)
+         AND lockedUntil <= ?
        ORDER BY COALESCE(nextRetryAt, createdAt), createdAt
        LIMIT ?`,
       now,
+      now,
       limit,
     );
+  }
+
+  async claimRequest(id: string, now: number, lockTimeoutMs: number): Promise<boolean> {
+    const db = await this.open();
+    const result = await db.run(
+      `UPDATE requests
+       SET lockedUntil = ?, updatedAt = ?
+       WHERE id = ?
+         AND status IN ('pending', 'retrying')
+         AND (nextRetryAt IS NULL OR nextRetryAt <= ?)
+         AND lockedUntil <= ?`,
+      now + lockTimeoutMs,
+      now,
+      id,
+      now,
+      now,
+    );
+
+    return (result.changes ?? 0) > 0;
+  }
+
+  async releaseRequestLock(id: string): Promise<void> {
+    await this.updateRequest(id, { lockedUntil: 0 });
   }
 
   async listAttempts(requestId: string): Promise<AttemptRow[]> {
@@ -202,7 +305,7 @@ export class RetryStorage {
     await db.run(
       `UPDATE requests SET
         url = ?, method = ?, body = ?, status = ?, attemptCount = ?, maxRetries = ?, backoffMs = ?, timeoutMs = ?,
-        nextRetryAt = ?, lastError = ?, result = ?, createdAt = ?, updatedAt = ?
+        nextRetryAt = ?, lockedUntil = ?, lastError = ?, result = ?, createdAt = ?, updatedAt = ?
        WHERE id = ?`,
       next.url,
       next.method,
@@ -213,6 +316,7 @@ export class RetryStorage {
       next.backoffMs,
       next.timeoutMs,
       next.nextRetryAt,
+      next.lockedUntil,
       next.lastError,
       next.result,
       next.createdAt,
@@ -225,7 +329,6 @@ export class RetryStorage {
 export class RetryEngine {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
-  private readonly processingIds = new Set<string>();
 
   constructor(private readonly storage: RetryStorage, private readonly options: RetryEngineOptions) {}
 
@@ -249,6 +352,22 @@ export class RetryEngine {
   }
 
   async submitRequest(input: CreateRequestInput): Promise<RequestApiModel> {
+    const validationError = validateCreateRequestInput(input, {
+      allowPrivateTargets: this.options.allowPrivateTargets,
+      allowedHosts: this.options.allowedHosts,
+    });
+    if (validationError) {
+      throw new RequestValidationError(validationError);
+    }
+
+    const runtimeTargetError = await validateTargetUrl(input.url, {
+      allowPrivateTargets: this.options.allowPrivateTargets,
+      allowedHosts: this.options.allowedHosts,
+    });
+    if (runtimeTargetError) {
+      throw new RequestValidationError(runtimeTargetError);
+    }
+
     const row = await this.storage.createRequest(input, {
       backoffMs: this.options.defaultBackoffMs ?? 1000,
       timeoutMs: this.options.defaultTimeoutMs ?? 5000,
@@ -283,18 +402,19 @@ export class RetryEngine {
     this.running = true;
     try {
       const dueRequests = await this.storage.listDueRequests(Date.now());
-      for (const request of dueRequests) {
-        if (this.processingIds.has(request.id)) {
-          continue;
+      const concurrencyLimit = normalizePositiveInteger(this.options.concurrencyLimit, 3);
+      await runWithConcurrency(dueRequests, concurrencyLimit, async (request) => {
+        const claimed = await this.storage.claimRequest(request.id, Date.now(), this.options.lockTimeoutMs ?? 30_000);
+        if (!claimed) {
+          return;
         }
 
-        this.processingIds.add(request.id);
         try {
           await this.processRequest(request.id);
         } finally {
-          this.processingIds.delete(request.id);
+          await this.storage.releaseRequestLock(request.id);
         }
-      }
+      });
     } finally {
       this.running = false;
     }
@@ -310,16 +430,17 @@ export class RetryEngine {
     const startedAt = Date.now();
     const result = await this.performExternalCall(request);
     const finishedAt = Date.now();
-    const jitterFactor = 0.8 + Math.random() * 0.4;
-    const waitMs = Math.round(request.backoffMs * Math.pow(2, attemptNumber - 1) * jitterFactor);
+    const shouldRetry = isRetryableOutcome(result.outcome) && attemptNumber <= request.maxRetries;
+    const jitterFactor = shouldRetry ? 0.8 + Math.random() * 0.4 : 1;
+    const waitMs = shouldRetry ? Math.round(request.backoffMs * Math.pow(2, attemptNumber - 1) * jitterFactor) : 0;
 
     await this.storage.recordAttempt({
       requestId: request.id,
       attemptNumber,
       startedAt,
       finishedAt,
-      waitMs: result.outcome === 'success' ? 0 : waitMs,
-      jitterFactor: result.outcome === 'success' ? 1 : jitterFactor,
+      waitMs,
+      jitterFactor,
       outcome: result.outcome,
       statusCode: result.statusCode,
       responseBody: result.responseBody,
@@ -332,6 +453,7 @@ export class RetryEngine {
         status: 'completed',
         attemptCount: attemptNumber,
         nextRetryAt: null,
+        lockedUntil: 0,
         lastError: null,
         result: result.responseBody,
         updatedAt,
@@ -345,6 +467,7 @@ export class RetryEngine {
         status: 'failed',
         attemptCount: attemptNumber,
         nextRetryAt: null,
+        lockedUntil: 0,
         lastError: result.errorMessage,
         result: result.responseBody,
         updatedAt,
@@ -353,11 +476,12 @@ export class RetryEngine {
       return;
     }
 
-    if (attemptNumber > request.maxRetries) {
+    if (!shouldRetry) {
       await this.storage.updateRequest(request.id, {
         status: 'failed',
         attemptCount: attemptNumber,
         nextRetryAt: null,
+        lockedUntil: 0,
         lastError: result.errorMessage,
         result: result.responseBody,
         updatedAt,
@@ -371,6 +495,7 @@ export class RetryEngine {
       status: 'retrying',
       attemptCount: attemptNumber,
       nextRetryAt,
+      lockedUntil: 0,
       lastError: result.errorMessage,
       result: result.responseBody,
       updatedAt,
@@ -382,6 +507,19 @@ export class RetryEngine {
   }
 
   private async performExternalCall(request: StoredRequestRow): Promise<ExternalCallResult> {
+    const targetValidationError = await validateTargetUrl(request.url, {
+      allowPrivateTargets: this.options.allowPrivateTargets,
+      allowedHosts: this.options.allowedHosts,
+    });
+    if (targetValidationError) {
+      return {
+        outcome: 'terminal_error',
+        statusCode: null,
+        responseBody: null,
+        errorMessage: targetValidationError,
+      };
+    }
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), request.timeoutMs);
     try {
@@ -485,4 +623,139 @@ function parseJsonOrText(value: string | null): unknown {
   } catch {
     return value;
   }
+}
+
+function validateOptionalInteger(value: unknown, minimum: number, maximum: number, fieldName: string): string | null {
+  if (value === undefined) {
+    return null;
+  }
+
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    return `${fieldName} must be an integer`;
+  }
+
+  if (value < minimum || value > maximum) {
+    return `${fieldName} must be between ${minimum} and ${maximum}`;
+  }
+
+  return null;
+}
+
+function validateSerializableBody(body: unknown): string | null {
+  if (body === undefined) {
+    return null;
+  }
+
+  try {
+    JSON.stringify(body);
+  } catch {
+    return 'body must be JSON serializable';
+  }
+
+  return null;
+}
+
+function serializeBody(body: unknown): string | null {
+  if (body === undefined) {
+    return null;
+  }
+
+  return JSON.stringify(body);
+}
+
+function validateTargetUrlSync(url: URL, options: RequestValidationOptions = {}): string | null {
+  if (options.allowPrivateTargets) {
+    return null;
+  }
+
+  const hostname = url.hostname.toLowerCase();
+
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
+    return 'localhost targets are not allowed';
+  }
+
+  if (isIP(hostname) && isPrivateOrLinkLocalIp(hostname)) {
+    return 'private or link-local IP targets are not allowed';
+  }
+
+  if (options.allowedHosts && options.allowedHosts.length > 0) {
+    const normalizedAllowedHosts = new Set(options.allowedHosts.map((host) => host.toLowerCase()));
+    if (!normalizedAllowedHosts.has(hostname)) {
+      return 'url host is not allowlisted';
+    }
+  }
+
+  return null;
+}
+
+async function validateTargetUrl(url: string, options: RequestValidationOptions = {}): Promise<string | null> {
+  const parsedUrl = new URL(url);
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    return 'url must use http or https';
+  }
+
+  if (options.allowPrivateTargets) {
+    return null;
+  }
+
+  const syncValidation = validateTargetUrlSync(parsedUrl, options);
+  if (syncValidation) {
+    return syncValidation;
+  }
+
+  if (isIP(parsedUrl.hostname)) {
+    return null;
+  }
+
+  try {
+    const resolved = await lookup(parsedUrl.hostname, { all: true });
+    for (const record of resolved) {
+      if (isPrivateOrLinkLocalIp(record.address)) {
+        return 'private or link-local IP targets are not allowed';
+      }
+    }
+  } catch {
+    return 'url host could not be resolved';
+  }
+
+  return null;
+}
+
+function isRetryableOutcome(outcome: AttemptOutcome): boolean {
+  return outcome === 'retryable_error' || outcome === 'timeout' || outcome === 'network_error';
+}
+
+function isPrivateOrLinkLocalIp(address: string): boolean {
+  if (isIP(address) === 4) {
+    const [a, b] = address.split('.').map(Number);
+    if (a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    return false;
+  }
+
+  if (isIP(address) === 6) {
+    const lower = address.toLowerCase();
+    return lower === '::1' || lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe80:');
+  }
+
+  return false;
+}
+
+async function runWithConcurrency<T>(items: T[], concurrencyLimit: number, handler: (item: T) => Promise<void>): Promise<void> {
+  const queue = [...items];
+  const workerCount = Math.max(1, Math.min(concurrencyLimit, queue.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      if (!item) {
+        return;
+      }
+
+      await handler(item);
+    }
+  });
+
+  await Promise.all(workers);
 }

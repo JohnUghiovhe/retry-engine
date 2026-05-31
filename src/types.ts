@@ -22,6 +22,7 @@ export interface StoredRequestRow {
   backoffMs: number;
   timeoutMs: number;
   nextRetryAt: number | null;
+  lockedUntil: number;
   lastError: string | null;
   result: string | null;
   createdAt: number;

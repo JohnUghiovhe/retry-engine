@@ -1,9 +1,15 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { RetryEngine, RetryStorage } from './retry-engine';
-import { CreateRequestInput, RequestStatus } from './types';
+import { RequestValidationError, RetryEngine, RetryStorage } from './retry-engine';
+import { RequestStatus } from './types';
 
 const port = normalizePositiveInteger(process.env.PORT ? Number(process.env.PORT) : undefined, 3000);
 const databasePath = process.env.DATABASE_PATH ?? 'data/retry-engine.sqlite';
+const maxRequestBodyBytes = normalizePositiveInteger(
+  process.env.MAX_REQUEST_BODY_BYTES ? Number(process.env.MAX_REQUEST_BODY_BYTES) : undefined,
+  1_048_576,
+);
+const allowPrivateTargets = process.env.ALLOW_PRIVATE_TARGETS === 'true';
+const allowedHosts = parseAllowedHosts(process.env.ALLOWED_TARGET_HOSTS);
 
 const storage = new RetryStorage(databasePath);
 const engine = new RetryEngine(storage, {
@@ -11,6 +17,8 @@ const engine = new RetryEngine(storage, {
   workerIntervalMs: 500,
   defaultBackoffMs: 1000,
   defaultTimeoutMs: 5000,
+  allowPrivateTargets,
+  allowedHosts,
   logger: (message) => console.log(message),
 });
 
@@ -41,14 +49,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
 
     if (req.method === 'POST' && url.pathname === '/request') {
-      const payload = await readJsonBody(req);
-      const validationError = validateCreateRequest(payload);
-      if (validationError) {
-        sendJson(res, 400, { error: validationError });
-        return;
-      }
-
-      const created = await engine.submitRequest(payload as CreateRequestInput);
+      const payload = await readJsonBody(req, maxRequestBodyBytes);
+      const created = await engine.submitRequest(payload as Parameters<RetryEngine['submitRequest']>[0]);
       sendJson(res, 202, { id: created.id, status: created.status });
       return;
     }
@@ -79,14 +81,43 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     sendJson(res, 404, { error: 'not found' });
   } catch (error) {
+    if (error instanceof RequestValidationError) {
+      sendJson(res, error.statusCode, { error: error.message });
+      return;
+    }
+
+    if (error instanceof SyntaxError) {
+      sendJson(res, 400, { error: 'invalid JSON body' });
+      return;
+    }
+
+    if (error instanceof PayloadTooLargeError) {
+      sendJson(res, 413, { error: error.message });
+      return;
+    }
+
     sendJson(res, 500, { error: error instanceof Error ? error.message : 'internal server error' });
   }
 }
 
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+class PayloadTooLargeError extends Error {
+  constructor() {
+    super('request body too large');
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> {
   const chunks: Buffer[] = [];
+  let totalBytes = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.length;
+    if (totalBytes > maxBytes) {
+      throw new PayloadTooLargeError();
+    }
+
+    chunks.push(buffer);
   }
 
   if (chunks.length === 0) {
@@ -94,29 +125,6 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   }
 
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-}
-
-function validateCreateRequest(payload: unknown): string | null {
-  if (!payload || typeof payload !== 'object') {
-    return 'body must be a JSON object';
-  }
-
-  const candidate = payload as Partial<CreateRequestInput>;
-  if (typeof candidate.url !== 'string' || candidate.url.trim().length === 0) {
-    return 'url is required';
-  }
-
-  if (typeof candidate.method !== 'string' || candidate.method.trim().length === 0) {
-    return 'method is required';
-  }
-
-  try {
-    new URL(candidate.url);
-  } catch {
-    return 'url must be valid';
-  }
-
-  return null;
 }
 
 function isRequestStatus(value: string): value is RequestStatus {
@@ -138,6 +146,19 @@ function normalizePositiveInteger(value: number | undefined, fallback: number): 
   }
 
   return Math.floor(value);
+}
+
+function parseAllowedHosts(value: string | undefined): string[] | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const hosts = value
+    .split(',')
+    .map((host) => host.trim())
+    .filter((host) => host.length > 0);
+
+  return hosts.length > 0 ? hosts : undefined;
 }
 
 if (require.main === module) {

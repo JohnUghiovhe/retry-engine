@@ -1,7 +1,7 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { existsSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { RetryEngine, RetryStorage } from './retry-engine';
+import { RequestValidationError, RetryEngine, RetryStorage } from './retry-engine';
 import { CreateRequestInput, RequestStatus } from './types';
 
 const demoDbPath = resolve('data/demo.sqlite');
@@ -24,6 +24,7 @@ async function main(): Promise<void> {
     workerIntervalMs: 500,
     defaultBackoffMs: 1000,
     defaultTimeoutMs: 5000,
+    allowPrivateTargets: true,
     logger: (message) => console.log(message),
   });
   await engine.start();
@@ -111,9 +112,28 @@ async function handleApiRequest(req: IncomingMessage, res: ServerResponse, engin
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
 
   if (req.method === 'POST' && url.pathname === '/request') {
-    const payload = await readJsonBody(req);
-    const created = await engine.submitRequest(payload as CreateRequestInput);
-    sendJson(res, 202, { id: created.id, status: created.status });
+    try {
+      const payload = await readJsonBody(req, 1_048_576);
+      const created = await engine.submitRequest(payload as CreateRequestInput);
+      sendJson(res, 202, { id: created.id, status: created.status });
+    } catch (error) {
+      if (error instanceof RequestValidationError) {
+        sendJson(res, error.statusCode, { error: error.message });
+        return;
+      }
+
+      if (error instanceof SyntaxError) {
+        sendJson(res, 400, { error: 'invalid JSON body' });
+        return;
+      }
+
+      if (error instanceof Error && error.message === 'request body too large') {
+        sendJson(res, 413, { error: error.message });
+        return;
+      }
+
+      sendJson(res, 500, { error: error instanceof Error ? error.message : 'internal server error' });
+    }
     return;
   }
 
@@ -133,10 +153,17 @@ async function handleApiRequest(req: IncomingMessage, res: ServerResponse, engin
   sendJson(res, 404, { error: 'not found' });
 }
 
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> {
   const chunks: Buffer[] = [];
+  let totalBytes = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.length;
+    if (totalBytes > maxBytes) {
+      throw new Error('request body too large');
+    }
+
+    chunks.push(buffer);
   }
 
   return chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'));

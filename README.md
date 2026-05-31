@@ -45,6 +45,10 @@ List requests by status:
 curl "http://127.0.0.1:3000/requests?status=failed"
 ```
 
+The `maxRetries` field is the retry budget after the initial attempt. For example, `maxRetries: 2` allows up to 3 total attempts.
+
+For local demos or localhost targets, set `ALLOW_PRIVATE_TARGETS=true` before starting the server. The demo script already enables private localhost targets internally. You can also set `ALLOWED_TARGET_HOSTS=api.example.com,webhook.example.com` to limit accepted hostnames.
+
 ## Retry Flow
 
 ```mermaid
@@ -77,6 +81,8 @@ The request detail view with attempt history is saved here:
 The first friction point was getting the TypeScript runtime, the SQLite wrapper, and the native driver to agree on a Node module setup. I also had to correct the backoff math so retries really doubled rather than drifting into a fixed increment pattern.
 Another subtle issue was avoiding duplicate processing while the worker woke up every 500ms. I solved that by keeping an in-process lock set and only updating the request row after each attempt finished.
 
+I also had to tighten request validation after the first pass so invalid JSON, oversized bodies, and unsafe targets were rejected up front instead of being handled too late.
+
 ## What I Learned
 
 I got more comfortable with using SQLite as an operational datastore for async work, especially with a separate attempts table instead of trying to cram every event into one row. I also learned how to structure a tiny worker loop so it stays simple but still behaves predictably under retry timing.
@@ -95,4 +101,4 @@ I now think more carefully about failure classes. A 4xx is not the same as a 5xx
 
 This project forced me to think like production software instead of a happy-path demo. I had to design for transient failure, persistence, dead-lettering, and observability of every attempt, not just the final outcome.
 
-I’m now more deliberate about retry policies, worker scheduling, and state transitions. In a real fintech or e-commerce system, I’d be quicker to ask: should this error be retried, how do we avoid retry storms, and how do we prove what happened when something eventually fails?
+I'm now more deliberate about retry policies, worker scheduling, and state transitions. In a real fintech or e-commerce system, I’d be quicker to ask: should this error be retried, how do we avoid retry storms, and how do we prove what happened when something eventually fails?
