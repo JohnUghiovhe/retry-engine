@@ -2,7 +2,10 @@ import 'dotenv/config';
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { existsSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { RequestValidationError, RetryEngine, RetryStorage } from './retry-engine';
+import { RetryEngine } from './retry-engine';
+import { RetryStorage } from './persistence/retry-storage';
+import { RequestValidationError } from './validation/request-validation';
+import { PayloadTooLargeError, readJsonBody, sendJson } from './utils/http-utils';
 import { CreateRequestInput, RequestStatus } from './types';
 
 const demoDbPath = resolve('data/demo.sqlite');
@@ -128,7 +131,7 @@ async function handleApiRequest(req: IncomingMessage, res: ServerResponse, engin
         return;
       }
 
-      if (error instanceof Error && error.message === 'request body too large') {
+      if (error instanceof PayloadTooLargeError) {
         sendJson(res, 413, { error: error.message });
         return;
       }
@@ -152,22 +155,6 @@ async function handleApiRequest(req: IncomingMessage, res: ServerResponse, engin
   }
 
   sendJson(res, 404, { error: 'not found' });
-}
-
-async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  let totalBytes = 0;
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    totalBytes += buffer.length;
-    if (totalBytes > maxBytes) {
-      throw new Error('request body too large');
-    }
-
-    chunks.push(buffer);
-  }
-
-  return chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
 async function submitRequest(port: number, payload: CreateRequestInput): Promise<{ id: string; status: string }> {
@@ -199,15 +186,6 @@ async function pollUntilFinished(port: number, id: string): Promise<void> {
 
 function printDetail(detail: any): void {
   console.log(JSON.stringify(detail, null, 2));
-}
-
-function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
-  const body = JSON.stringify(payload, null, 2);
-  res.writeHead(statusCode, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(body),
-  });
-  res.end(body);
 }
 
 function listen(server: ReturnType<typeof createServer>, port: number): Promise<void> {
