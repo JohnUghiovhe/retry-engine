@@ -169,6 +169,12 @@ export class RetryStorage {
       CREATE INDEX IF NOT EXISTS idx_attempts_requestId
       ON attempts (requestId, attemptNumber);
     `);
+
+    const requestColumns = await db.all<{ name: string }[]>('PRAGMA table_info(requests)');
+    const hasLockedUntil = requestColumns.some((column) => column.name === 'lockedUntil');
+    if (!hasLockedUntil) {
+      await db.exec('ALTER TABLE requests ADD COLUMN lockedUntil INTEGER NOT NULL DEFAULT 0;');
+    }
   }
 
   async createRequest(input: CreateRequestInput, defaults: { backoffMs: number; timeoutMs: number }): Promise<StoredRequestRow> {
