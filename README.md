@@ -22,21 +22,29 @@ npm test
 Create a request:
 
 ```bash
-curl -X POST http://127.0.0.1:3000/request \
-  -H "content-type: application/json" \
-  -d '{
-    "url":"https://example.com/webhook",
-    "method":"POST",
-    "body":{"hello":"world"},
-    "maxRetries":5,
-    "backoffMs":1000
-  }'
+curl.exe -X POST http://127.0.0.1:3000/request ^
+  -H "content-type: application/json" ^
+  -d "{\"url\":\"https://example.com/webhook\",\"method\":\"POST\",\"body\":{\"hello\":\"world\"},\"maxRetries\":5,\"backoffMs\":1000}"
+```
+
+If you are using Windows PowerShell, this form is usually easier to run:
+
+```powershell
+$body = @{ url = 'https://example.com/webhook'; method = 'POST'; body = @{ hello = 'world' }; maxRetries = 5; backoffMs = 1000 } | ConvertTo-Json -Depth 5
+$response = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:3000/request' -ContentType 'application/json' -Body $body
+$response
 ```
 
 Get one request and its attempts:
 
 ```bash
-curl http://127.0.0.1:3000/requests/:id
+curl.exe http://127.0.0.1:3000/requests/<request-id>
+```
+
+PowerShell version:
+
+```powershell
+Invoke-RestMethod -Uri ("http://127.0.0.1:3000/requests/$($response.id)")
 ```
 
 List requests by status:
@@ -45,9 +53,18 @@ List requests by status:
 curl "http://127.0.0.1:3000/requests?status=failed"
 ```
 
+On PowerShell, use `curl.exe` instead of `curl`. If you use `curl`, PowerShell may route the command to `Invoke-WebRequest`, which does not accept the same flags.
+
 The `maxRetries` field is the retry budget after the initial attempt. For example, `maxRetries: 2` allows up to 3 total attempts.
 
 For local demos or localhost targets, set `ALLOW_PRIVATE_TARGETS=true` before starting the server. The demo script already enables private localhost targets internally. You can also set `ALLOWED_TARGET_HOSTS=api.example.com,webhook.example.com` to limit accepted hostnames.
+
+If you want to use a local mock URL in the request body, start the server like this:
+
+```powershell
+$env:ALLOW_PRIVATE_TARGETS = 'true'
+npm run start
+```
 
 ## Retry Flow
 

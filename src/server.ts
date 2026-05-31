@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { RequestValidationError, RetryEngine, RetryStorage } from './retry-engine';
 import { RequestStatus } from './types';

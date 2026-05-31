@@ -24,6 +24,7 @@
   "homepage": "https://github.com/JohnUghiovhe/retry-engine#readme",
   "dependencies": {
     "@types/node": "^25.9.1",
+    "dotenv": "^17.4.2",
     "sqlite": "^5.1.1",
     "sqlite3": "^6.0.1",
     "tsx": "^4.22.3",
