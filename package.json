@@ -1,0 +1,32 @@
+{
+  "name": "retry-engine",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "dev": "tsx src/server.ts",
+    "demo": "tsx src/demo.ts",
+    "test": "tsx src/demo.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JohnUghiovhe/retry-engine.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/JohnUghiovhe/retry-engine/issues"
+  },
+  "homepage": "https://github.com/JohnUghiovhe/retry-engine#readme",
+  "dependencies": {
+    "@types/node": "^25.9.1",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^6.0.1",
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3"
+  }
+}
